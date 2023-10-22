@@ -99,7 +99,7 @@ def cut_kmer(read: str, kmer_size: int) -> Iterator[str]:
     :return: A generator object that provides the kmers (str) of size kmer_size.
     """
 
-    for i in range(len(read) - kmer_size + 1):
+    for i in range(len(read) - (kmer_size - 1)):
         yield read[i:i+kmer_size]
 
 
@@ -110,19 +110,14 @@ def build_kmer_dict(fastq_file: Path, kmer_size: int) -> Dict[str, int]:
     :return: A dictionnary object that identify all kmer occurrences.
     """
 
+    list_seq = list(read_fastq(fastq_file))
     kmer_dict = {}
 
-    with open(fastq_file, 'r') as file:
-        lines = file.readlines()
-        for i in range(1, len(lines), 4):
-            read = lines[i].strip()
-            for j in range(len(read) - kmer_size + 1):
-                kmer = read[j:j+kmer_size]
-                if kmer in kmer_dict:
-                    kmer_dict[kmer] += 1
-                else:
-                    kmer_dict[kmer] = 1
-
+    for seq in list_seq:
+        list_kmer = list(cut_kmer(seq, kmer_size))
+        for kmer in list_kmer:
+            if kmer not in kmer_dict:
+                kmer_dict[kmer] = list_kmer.count(kmer)
     return kmer_dict
 
 
@@ -133,10 +128,13 @@ def build_graph(kmer_dict: Dict[str, int]) -> DiGraph:
     :return: A directed graph (nx) of all kmer substring and weight (occurrence).
     """
     graph = nx.DiGraph()
-    for kmer, count in kmer_dict.items():
+    for kmer, weight in kmer_dict.items():
         prefix = kmer[:-1]
         suffix = kmer[1:]
-        graph.add_edge(prefix, suffix, weight=count)
+        if graph.has_edge(prefix, suffix):
+            graph[prefix][suffix]['weight'] += weight
+        else:
+            graph.add_edge(prefix, suffix, weight=weight)
     return graph
 
 
@@ -236,16 +234,23 @@ def simplify_bubbles(graph: DiGraph) -> DiGraph:
     :param graph: (nx.DiGraph) A directed graph object
     :return: (nx.DiGraph) A directed graph object
     """
-    cleaned_graph = graph.copy()
-    for node in graph.nodes():
-        predecessors = list(cleaned_graph.predecessors(node))
-        descendants = list(cleaned_graph.successors(node))
+    bubble = False
 
-        if len(predecessors) == 1 and len(descendants) == 1:
-            cleaned_graph.remove_node(node)
-            cleaned_graph.add_edge(predecessors[0], descendants[0])
+    for node_n in graph:
+        predecessors_list = list(graph.predecessors(node_n))
+        if len(predecessors_list) > 1:
+            for i, node_i in enumerate(predecessors_list[:-1]):
+                for node_j in predecessors_list[i + 1:]:
+                    ancestor_node = nx.lowest_common_ancestor(graph, node_i, node_j)
+                    if ancestor_node is not None:
+                        bubble = True
+                        break
+        if bubble:
+            break
+    if bubble:
+        graph = simplify_bubbles(solve_bubble(graph, ancestor_node, node_n))
 
-    return cleaned_graph
+    return graph
 
 
 def solve_entry_tips(graph: DiGraph, starting_nodes: List[str]) -> DiGraph: 
@@ -256,18 +261,36 @@ def solve_entry_tips(graph: DiGraph, starting_nodes: List[str]) -> DiGraph:
     """
 
     path_list = []
-    path_length_list = []
-    weight_avg_list =[]
+    list_nodes = list(graph.nodes())
     
-    for node in starting_nodes :
-        for descendant in nx.descendants(graph, node): 
-            predecessor = list(graph.predecessors(descendant))
-            if len(predecessor) > 1:
-                for path in nx.all_simple_paths(graph, node, descendant):
-                    path_list.append(path)
-                    path_length_list.append(len(path))
-                    weight_avg_list.append(path_average_weight(graph, path))
-    graph = select_best_path(graph, path_list, path_length_list, weight_avg_list, True, False)
+    for node in list_nodes :
+        predecessors = list(graph.predecessors(node))
+
+        if len(predecessors) > 1:
+            for start_node in starting_nodes:
+                paths = list(nx.all_simple_paths(graph, start_node, node))
+                if paths:
+                    path_list.append(list(paths)[0])
+
+            if len(path_list) > 1:
+                len_list = [len(path) for path in path_list]
+                path_weights = []
+                for i, path in enumerate(path_list):
+                    if len_list[i] > 1:
+                        weight = path_average_weight(graph, path)
+                    else:
+                        weight = graph[path[0]][path[1]]["weight"]
+                    path_weights.append(weight)
+
+                new_graph = select_best_path(
+                    graph, path_list, len_list, path_weights,
+                    delete_entry_node=True, delete_sink_node=False
+                )
+
+                if new_graph != graph:
+                    return solve_entry_tips(new_graph, starting_nodes)
+                else:
+                    return graph
     return graph
 
 
@@ -280,21 +303,36 @@ def solve_out_tips(graph: DiGraph, ending_nodes: List[str]) -> DiGraph:
     """
 
     path_list = []
-    path_length = []
-    weight_avg_list = []
-    for node in graph.nodes:
+    list_nodes = list(graph.nodes())
+
+    for node in list_nodes:
         successors_list = list(graph.successors(node))
+
         if len(successors_list) > 1:
             for end_node in ending_nodes:
-                for path in nx.all_simple_paths(graph, node, end_node):
-                    path_list.append(path)
+                paths = list(nx.all_simple_paths(graph, node, end_node))
+                if paths:
+                    path_list.append(list(paths)[0])
 
-    if len(path_list) != 0:
-        for path in path_list:
-            path_length.append(len(path))
-            weight_avg_list.append(path_average_weight(graph, path))
-        graph = select_best_path(graph, path_list, path_length, weight_avg_list,
-                                 delete_entry_node=False, delete_sink_node=True)
+            if len(path_list) > 1:
+                len_list = [len(path) for path in path_list]
+                path_weights = []
+                for i, path in enumerate(path_list):
+                    if len_list[i] > 1:
+                        weight = path_average_weight(graph, path)
+                    else:
+                        weight = graph[path[0]][path[1]]["weight"]
+                    path_weights.append(weight)
+
+                new_graph = select_best_path(
+                    graph, path_list, len_list, path_weights,
+                    delete_entry_node=False, delete_sink_node=True
+                )
+                if new_graph != graph:
+                    return solve_out_tips(new_graph, ending_nodes)
+                else:
+                    return graph
+
     return graph
 
 
@@ -398,14 +436,14 @@ def main(): # pragma: no cover
     # if args.graphimg_file:
     #     draw_graph(graph, args.graphimg_file)
     kmer_dict = build_kmer_dict(args.fastq_file, args.kmer_size)
-    graph_build = build_graph(kmer_dict)
-    graph = simplify_bubbles(graph_build)
+    graph = build_graph(kmer_dict)
+    graph = simplify_bubbles(graph)
     starting_nodes = get_starting_nodes(graph)
     ending_nodes = get_sink_nodes(graph)
-    graph_entry = solve_entry_tips(graph, starting_nodes)
-    graph_out = solve_out_tips(graph, ending_nodes)
-    new_starting_nodes = get_starting_nodes(graph_entry)
-    new_ending_nodes = get_sink_nodes(graph_out)
+    solve_entry_tips(graph, starting_nodes)
+    graph = solve_out_tips(graph, ending_nodes)
+    new_starting_nodes = get_starting_nodes(graph)
+    new_ending_nodes = get_sink_nodes(graph)
     contigs_list = get_contigs(graph, new_starting_nodes, new_ending_nodes)
     save_contigs(contigs_list, args.output_file)
 
